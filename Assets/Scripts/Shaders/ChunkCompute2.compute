@@ -9,7 +9,6 @@
 #define SIZEOF_UINT		4
 
 
-//#include "UnityCG.cginc"
 #include "NoiseShaderLib/NoiseLib.cginc"
 #include "LookupTables.cginc"
 
