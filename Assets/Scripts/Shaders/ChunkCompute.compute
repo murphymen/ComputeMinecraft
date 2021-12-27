@@ -1,0 +1,280 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel ClearBuffers
+#pragma kernel PopulateVoxelMap
+#pragma kernel AddVoxelDataToChunk
+
+#define SIZEOF_FLOAT	4
+#define SIZEOF_FLOAT3	12
+#define SIZEOF_UINT		4
+
+
+//#include "UnityCG.cginc"
+#include "NoiseShaderLib/NoiseLib.cginc"
+#include "LookupTables.cginc"
+#include "Random.cginc"
+
+
+RWStructuredBuffer<uint> _voxelMap;
+RWByteAddressBuffer _vertexBuffer;
+RWByteAddressBuffer _normalBuffer;
+RWByteAddressBuffer _texcoordBuffer;
+RWByteAddressBuffer _indexBuffer;
+//RWStructuredBuffer<uint> _indexCounter;
+//RWStructuredBuffer<uint> _vertexCounter;
+//RWStructuredBuffer<uint> _count;
+
+//RWStructuredBuffer<float> _vertexDebugBuffer;
+//RWStructuredBuffer<uint> _indexDebugBuffer;
+//RWStructuredBuffer<float> _idDebugBuffer;
+
+static uint _dimmX = 32;
+static uint _dimmY = 32;
+static uint _dimmZ = 32;
+static uint3 _dimms = uint3(_dimmX, _dimmY, _dimmZ);
+float _deltaTime;
+// Noise generation
+float _frequency,
+        _amplitude,
+        _octaves,
+        _persist,
+        _lacun;
+//bool debugMode;
+
+uint FlatIndex(uint x, uint y, uint z, uint dimmX, uint dimmY, uint dimmZ)
+{
+    return x + (y * dimmX) + (z * dimmX * dimmY);
+}
+
+uint FlatIndex(uint3 index, uint3 dimm)
+{
+    return index.x + (index.y * dimm.x) + (index.z * dimm.x * dimm.y);
+}
+
+uint VertexAdress(uint vert, uint wall)
+{
+    return (wall * 48) + (vert * 12);
+}
+
+
+[numthreads(8,8,8)]
+void ClearBuffers(uint3 id : SV_DispatchThreadID)
+{
+    // Boundary check
+    if (id.x >= _dimms.x || id.y >= _dimms.y || id.z >= _dimms.z)
+        return;
+    
+    uint flatId = FlatIndex(id, _dimms);
+    uint Vaddr = 0;
+    uint Iaddr = 0;
+    uint index = 0;
+    int vBaseAdress = flatId * 288;
+    int iBaseAdress = flatId * 144;
+    uint indexBase = flatId * 24;
+    
+    for (int p = 0; p < 6; p++)
+    {
+        Vaddr = vBaseAdress + (p * 48);
+        Iaddr = iBaseAdress + (p * 24);
+        index = indexBase + (p * 4);
+        
+        _vertexBuffer.Store3(Vaddr, asuint(0));
+        _vertexBuffer.Store3(Vaddr + 12, asuint(0));
+        _vertexBuffer.Store3(Vaddr + 24, asuint(0));
+        _vertexBuffer.Store3(Vaddr + 36, asuint(0));
+        
+        _normalBuffer.Store3(Vaddr, asuint(0));
+        _normalBuffer.Store3(Vaddr + 12, asuint(0));
+        _normalBuffer.Store3(Vaddr + 24, asuint(0));
+        _normalBuffer.Store3(Vaddr + 36, asuint(0));
+        
+        _texcoordBuffer.Store2(Vaddr, asuint(0));
+        _texcoordBuffer.Store2(Vaddr + 8, asuint(0));
+        _texcoordBuffer.Store2(Vaddr + 16, asuint(0));
+        _texcoordBuffer.Store2(Vaddr + 24, asuint(0));
+        
+        // Indexes
+        _indexBuffer.Store3(Iaddr, uint3(0, 0, 0));
+        _indexBuffer.Store3(Iaddr + 12, uint3(0, 0, 0));
+        
+        //_idDebugBuffer[flatId] = 0;
+    }
+}
+
+//uint _seed = 666;
+//uint _rngState;
+
+// Hash function from H. Schechter & R. Bridson, goo.gl/RXiKaH
+/*
+uint Hash(uint s)
+{
+    s ^= 2747636419u;
+    s *= 2654435769u;
+    s ^= s >> 16;
+    s *= 2654435769u;
+    s ^= s >> 16;
+    s *= 2654435769u;
+    return s;
+}
+
+float Random()
+{
+    return _seed = float(Hash(_seed)) / 4294967295.0; // 2^32-1
+}
+*/
+
+[numthreads(8,8,8)]
+void PopulateVoxelMap (uint3 id : SV_DispatchThreadID)
+{
+    // Boundary check
+    if (id.x >= _dimms.x || id.y >= _dimms.y || id.z >= _dimms.z)
+        return;
+    
+    int val = 0;
+    float noise = perlin3d(id.xyz, _frequency, _amplitude, _octaves, _persist, _lacun);
+    if (noise > 0.5)
+        val = 1;
+    else
+        val = 0;
+    
+    
+    _voxelMap[FlatIndex(id.x, id.y, id.z, _dimmX, _dimmY, _dimmZ)] = val;
+    _voxelMap[FlatIndex(0, 0, 0, _dimmX, _dimmY, _dimmZ)] = 0;
+    //_idDebugBuffer[FlatIndex(id.x, id.y, id.z, _dimmX, _dimmY, _dimmZ)] = noise;
+}
+
+bool CheckVoxel(float3 pos)
+{
+    int x = floor(pos.x);
+    int y = floor(pos.y);
+    int z = floor(pos.z);
+
+    if (x < 0 || x > (int) _dimms.x - 1 ||
+        y < 0 || y > (int) _dimms.y - 1 ||
+        z < 0 || z > (int) _dimms.z - 1)
+    return false;
+
+    return _voxelMap[FlatIndex(x, y, z, _dimmX, _dimmY, _dimmZ)];
+}
+
+[numthreads(8, 8, 8)]
+void AddVoxelDataToChunk(uint3 id : SV_DispatchThreadID)
+{    
+    uint flatId = FlatIndex(id, _dimms);
+    // Boundary check
+    //if (flatId >= _dimms.x*_dimms.y*_dimms.z)
+    //    return;
+    
+    //if (any(id + 1 >= _dimms.xyz))
+    //    return;
+    
+    if (id.x >= _dimms.x || id.y >= _dimms.y || id.z >= _dimms.z)
+        return;
+    
+    uint Vaddr = 0;
+    uint Iaddr = 0;
+    uint index = 0;
+    int vBaseAdress = flatId * 288;
+    int iBaseAdress = flatId * 144; //36
+    uint indexBase = flatId * 24;
+    
+    for (int p = 0; p < 6; p++)
+    {
+        Vaddr = vBaseAdress + (p * 48);
+        Iaddr = iBaseAdress + (p * 24);
+        index = indexBase + (p * 4);
+        
+        float3 vertex0 = id + voxelVerts[voxelTris[p][0]];
+        float3 vertex1 = id + voxelVerts[voxelTris[p][1]];
+        float3 vertex2 = id + voxelVerts[voxelTris[p][2]];
+        float3 vertex3 = id + voxelVerts[voxelTris[p][3]];
+        
+        uint addr0 = index;
+        uint addr1 = index + 1;
+        uint addr2 = index + 2;
+        uint addr3 = index + 3;
+        
+        float3 U = vertex1 - vertex0;
+        float3 V = vertex2 - vertex0;
+        float3 faceNormal = 0;
+        
+        if (!CheckVoxel(id + faceChecks[p]) && _voxelMap[FlatIndex(id.x, id.y, id.z, _dimmX, _dimmY, _dimmZ)] != 0)
+        {
+            _vertexBuffer.Store3(Vaddr, asuint(vertex0));
+            _vertexBuffer.Store3(Vaddr + 12, asuint(vertex1));
+            _vertexBuffer.Store3(Vaddr + 24, asuint(vertex2));
+            _vertexBuffer.Store3(Vaddr + 36, asuint(vertex3));
+        
+            _texcoordBuffer.Store2(Vaddr, asuint(voxelUvs[0]));
+            _texcoordBuffer.Store2(Vaddr + 8, asuint(voxelUvs[1]));
+            _texcoordBuffer.Store2(Vaddr + 16, asuint(voxelUvs[2]));
+            _texcoordBuffer.Store2(Vaddr + 24, asuint(voxelUvs[3]));
+            
+            faceNormal.x = (U.y * V.z) - (U.z * V.y);
+            faceNormal.y = (U.z * V.x) - (U.x * V.z);
+            faceNormal.z = (U.x * V.y) - (U.y * V.x);
+            //faceNormal = normalize(faceNormal);
+            faceNormal = 1;
+            
+            _normalBuffer.Store3(Vaddr, asuint(faceNormal));
+            _normalBuffer.Store3(Vaddr + 12, asuint(faceNormal));
+            _normalBuffer.Store3(Vaddr + 24, asuint(faceNormal));
+            _normalBuffer.Store3(Vaddr + 36, asuint(faceNormal));
+        
+        // Indexes
+            _indexBuffer.Store3(Iaddr, uint3(addr0, addr1, addr2));
+            _indexBuffer.Store3(Iaddr + 12, uint3(addr2, addr1, addr3));
+        }
+        else
+        {
+            _vertexBuffer.Store3(Vaddr, asuint(0));
+            _vertexBuffer.Store3(Vaddr + 12, asuint(0));
+            _vertexBuffer.Store3(Vaddr + 24, asuint(0));
+            _vertexBuffer.Store3(Vaddr + 36, asuint(0));
+        
+            _texcoordBuffer.Store2(Vaddr, asuint(0));
+            _texcoordBuffer.Store2(Vaddr + 8, asuint(0));
+            _texcoordBuffer.Store2(Vaddr + 16, asuint(0));
+            _texcoordBuffer.Store2(Vaddr + 24, asuint(0));
+            
+            _normalBuffer.Store3(Vaddr, asuint(0));
+            _normalBuffer.Store3(Vaddr + 12, asuint(0));
+            _normalBuffer.Store3(Vaddr + 24, asuint(0));
+            _normalBuffer.Store3(Vaddr + 36, asuint(0));
+        
+        // Indexes
+            _indexBuffer.Store3(Iaddr, uint3(0, 0, 0));
+            _indexBuffer.Store3(Iaddr + 12, uint3(0, 0, 0));
+        
+                //_idDebugBuffer[flatId] = 0;
+        }
+    }
+    
+    /*
+    for (int p = 0; p < 6; p++)
+    {
+        if (!CheckVoxel(pos + faceChecks[p]))
+        {	
+            
+            vertices.Add(pos + VoxelData.voxelVerts[VoxelData.voxelTris[p, 0]]);
+            vertices.Add(pos + VoxelData.voxelVerts[VoxelData.voxelTris[p, 1]]);
+            vertices.Add(pos + VoxelData.voxelVerts[VoxelData.voxelTris[p, 2]]);
+            vertices.Add(pos + VoxelData.voxelVerts[VoxelData.voxelTris[p, 3]]);
+            uvs.Add(VoxelData.voxelUvs[0]);
+            uvs.Add(VoxelData.voxelUvs[1]);
+            uvs.Add(VoxelData.voxelUvs[2]);
+            uvs.Add(VoxelData.voxelUvs[3]);
+            triangles.Add(vertexIndex);
+            triangles.Add(vertexIndex + 1);
+            triangles.Add(vertexIndex + 2);
+            triangles.Add(vertexIndex + 2);
+            triangles.Add(vertexIndex + 1);
+            triangles.Add(vertexIndex + 3);
+            vertexIndex += 4;
+            
+        }
+    }*/
+}
+
+
+
+

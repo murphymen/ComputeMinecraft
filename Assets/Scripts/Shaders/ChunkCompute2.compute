@@ -1,0 +1,171 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel ClearUnusedData
+#pragma kernel PopulateVoxelMap
+#pragma kernel AddVoxelDataToChunk
+
+#define SIZEOF_FLOAT	4
+#define SIZEOF_FLOAT3	12
+#define SIZEOF_FLOAT2    8
+#define SIZEOF_UINT		4
+
+
+//#include "UnityCG.cginc"
+#include "NoiseShaderLib/NoiseLib.cginc"
+#include "LookupTables.cginc"
+
+
+
+RWStructuredBuffer<uint> _voxelMap;
+RWByteAddressBuffer _vertexBuffer;
+RWByteAddressBuffer _normalBuffer;
+RWByteAddressBuffer _texcoordBuffer;
+RWByteAddressBuffer _indexBuffer;
+RWStructuredBuffer<uint> _count;
+
+uint _positionX; // Position of the chunk in world
+uint _positionY; // Position of the chunk in world
+uint _positionZ; // Position of the chunk in world
+uint3 _dimms;   // Dimensions of the chunk
+//static uint maxTriangles = _dimmX * _dimmY * _dimmZ * 6 * 2;
+uint _triangleBudget;
+float _deltaTime;
+// Noise generation
+float _frequency,
+        _amplitude,
+        _octaves,
+        _persist,
+        _lacun;
+//bool debugMode;
+
+uint FlatIndex(uint x, uint y, uint z, uint dimmX, uint dimmY, uint dimmZ)
+{
+    return x + (y * dimmX) + (z * dimmX * dimmY);
+}
+
+uint FlatIndex(uint3 index, uint3 dimm)
+{
+    return index.x + (index.y * dimm.x) + (index.z * dimm.x * dimm.y);
+}
+
+// Vertex buffer accessor
+void WriteVertex(uint offset, float3 p, float3 n, float2 t)
+{
+    uint addr_p = offset * SIZEOF_FLOAT3;
+    uint addr_uv = offset * SIZEOF_FLOAT2;
+
+    _vertexBuffer.Store3(addr_p, asuint(p));
+    _normalBuffer.Store3(addr_p, asuint(n));
+    _texcoordBuffer.Store2(addr_uv, asuint(t));
+}
+
+// Index buffer accessor
+void WriteIndices(uint offset, uint3 indices)
+{
+    _indexBuffer.Store3(offset * SIZEOF_UINT, indices);
+}
+
+[numthreads(128, 1, 1)]
+void ClearUnusedData(uint3 id : SV_DispatchThreadID)
+{
+    while (true)
+    {
+        uint count = _count.IncrementCounter();
+        if (count >= _triangleBudget) break;
+        uint vidx = count * 3;
+        WriteVertex(vidx + 0, 0, 0, 0);
+        WriteVertex(vidx + 1, 0, 0, 0);
+        WriteVertex(vidx + 2, 0, 0, 0);
+        WriteIndices(vidx, uint3(0, 0, 0));
+    }
+}
+
+[numthreads(8,8,8)]
+void PopulateVoxelMap (uint3 id : SV_DispatchThreadID)
+{
+    // Boundary check
+    //if (id.x >= _dimms.x || id.y >= _dimms.y || id.z >= _dimms.z)
+    //    return;
+
+    // Boundary check
+    if (any(id > _dimms.xyz))
+        return;
+    
+    int val = 0;
+    float noise = perlin3d(id.xyz + float3(0.001, 0.002,  0.001) + float3(_positionX, _positionY, _positionZ), _frequency, _amplitude, _octaves, _persist, _lacun);
+    if (noise > 0.5)
+        val = 1;
+    else
+        val = 0;
+    
+    _voxelMap[FlatIndex(id.x, id.y, id.z, _dimms.x, _dimms.y, _dimms.z)] = val;
+    _voxelMap[FlatIndex(0, 0, 0, _dimms.x, _dimms.y, _dimms.z)] = 0;
+}
+
+bool CheckVoxel(float3 pos)
+{
+    int x = floor(pos.x);
+    int y = floor(pos.y);
+    int z = floor(pos.z);
+
+    if (x < 0 || x > (int) _dimms.x - 1 ||
+        y < 0 || y > (int) _dimms.y - 1 ||
+        z < 0 || z > (int) _dimms.z - 1)
+    return false;
+
+    return _voxelMap[FlatIndex(x, y, z, _dimms.x, _dimms.y, _dimms.z)];
+}
+
+[numthreads(8, 8, 8)]
+void AddVoxelDataToChunk(uint3 id : SV_DispatchThreadID)
+{    
+    uint flatId = FlatIndex(id, _dimms);
+    
+    // Boundary check
+    if (any(id > _dimms.xyz))
+        return;
+    
+    //if (id.x >= _dimms.x || id.y >= _dimms.y || id.z >= _dimms.z)
+    //    return;
+    
+    for (int p = 0; p < 6; p++)
+    {
+        float3 vertex0 = id + voxelVerts[voxelTris[p][0]] + float3(_positionX, _positionY, _positionZ);
+        float3 vertex1 = id + voxelVerts[voxelTris[p][1]] + float3(_positionX, _positionY, _positionZ);
+        float3 vertex2 = id + voxelVerts[voxelTris[p][2]] + float3(_positionX, _positionY, _positionZ);
+        float3 vertex3 = id + voxelVerts[voxelTris[p][3]] + float3(_positionX, _positionY, _positionZ);
+        
+        if (!CheckVoxel(id + faceChecks[p]) && _voxelMap[FlatIndex(id.x, id.y, id.z, _dimms.x, _dimms.y, _dimms.z)] != 0)
+        {
+            float3 U = vertex1 - vertex0;
+            float3 V = vertex2 - vertex0;
+            float3 faceNormal;
+            faceNormal.x = (U.y * V.z) - (U.z * V.y);
+            faceNormal.y = (U.z * V.x) - (U.x * V.z);
+            faceNormal.z = (U.x * V.y) - (U.y * V.x);
+            
+            uint count = _count.IncrementCounter();
+
+            if (count >= _triangleBudget*3)
+                return;
+
+            uint vid = count * 3;
+
+            WriteVertex(vid + 0, vertex0, faceNormal, voxelUvs[0]);
+            WriteVertex(vid + 1, vertex1, faceNormal, voxelUvs[1]);
+            WriteVertex(vid + 2, vertex2, faceNormal, voxelUvs[2]);
+            WriteIndices(vid, uint3(vid + 0, vid + 1, vid + 2));
+
+            count = _count.IncrementCounter();
+            vid = count * 3;
+
+            WriteVertex(vid + 0, vertex2, faceNormal, voxelUvs[2]);
+            WriteVertex(vid + 1, vertex1, faceNormal, voxelUvs[1]);
+            WriteVertex(vid + 2, vertex3, faceNormal, voxelUvs[3]);
+            WriteIndices(vid, uint3(vid + 0, vid + 1, vid + 2));
+        }
+    }
+}
+
+
+
+
